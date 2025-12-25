@@ -1,0 +1,1359 @@
+# Authentication Security Passport
+
+> Обновлено: 2025-12-21
+> Версия: 3.0
+> Auth Service: v1.20.1+
+
+## Обзор механизмов аутентификации
+
+Платформа Vondi использует многоуровневую систему аутентификации с поддержкой:
+
+1. **JWT RS256** - асимметричная криптография для токенов доступа
+2. **Refresh Token Rotation** - защита от повторного использования токенов
+3. **Multi-Provider OAuth** - Google OAuth 2.0, Firebase Phone Auth
+4. **Bcrypt Password Hashing** - стойкое хеширование паролей (cost 12)
+5. **Account Lockout** - защита от брутфорса (5 попыток)
+6. **Token Revocation** - немедленная инвалидация скомпрометированных токенов
+7. **Session Management** - контроль активных сессий пользователя
+8. **Service-to-Service Auth** - межсервисная аутентификация
+
+---
+
+## 1. JWT RS256 Architecture
+
+### Алгоритм: RS256 (RSA Signature with SHA-256)
+
+**Почему RS256:**
+- Асимметричная криптография (private key для подписи, public key для проверки)
+- Публичный ключ можно безопасно распространять для валидации токенов
+- Невозможно сгенерировать поддельный токен без приватного ключа
+- Соответствует RFC 7519 (JWT) и RFC 7515 (JWS)
+
+### Генерация ключей
+
+```bash
+# Private key (PKCS1 RSA 2048 bit)
+openssl genrsa -out private.pem 2048
+
+# Public key (PKIX)
+openssl rsa -in private.pem -pubout -out public.pem
+```
+
+### Структура Access Token
+
+**Header:**
+```json
+{
+  "alg": "RS256",
+  "typ": "JWT"
+}
+```
+
+**Payload (JWTClaims):**
+```json
+{
+  "jti": "uuid-v4",                    // JWT ID (уникальный идентификатор токена)
+  "sub": "123",                         // Subject (user_id как строка)
+  "iss": "https://auth.vondi.rs",      // Issuer
+  "aud": ["https://vondi.rs"],         // Audience
+  "exp": 1703361234,                   // Expiration (Unix timestamp)
+  "iat": 1703360334,                   // Issued At
+  "nbf": 1703360334,                   // Not Before
+
+  "user_id": 123,                      // Vondi: ID пользователя (int)
+  "user_uuid": "uuid-v4",              // Vondi: UUID пользователя
+  "email": "user@example.com",         // Vondi: Email
+  "name": "John Doe",                  // Vondi: Имя пользователя
+  "provider": "local",                 // Vondi: Провайдер (local/google/firebase)
+  "service_name": "tasktracker",       // Vondi: Имя сервиса (для S2S auth)
+  "roles": ["user", "admin"],          // Vondi: Роли пользователя
+  "term_accepted": true,               // Vondi: Принятие условий использования
+  "email_verified": true,              // Vondi: Подтверждение email
+  "two_factor_enabled": false          // Vondi: Статус 2FA
+}
+```
+
+**Signature:**
+```
+RSASSA-PKCS1-v1_5 using SHA-256(
+  base64UrlEncode(header) + "." + base64UrlEncode(payload),
+  privateKey
+)
+```
+
+### Валидация токена
+
+**Этапы проверки:**
+1. Декодирование header и payload (Base64URL)
+2. Проверка алгоритма (`alg == "RS256"`)
+3. Проверка подписи с использованием public key
+4. Проверка стандартных claims:
+   - `exp` - токен не истёк
+   - `nbf` - токен уже действителен
+   - `iss` - корректный issuer
+   - `aud` - токен выдан для правильной аудитории
+5. Проверка кастомных claims (roles, email_verified и т.д.)
+
+**Реализация (Go):**
+```go
+// pkg/service/jwt_validator.go
+func (v *JWTValidator) ValidateAccessToken(tokenString string) (*entity.JWTClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenString, &entity.JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+        // Проверка алгоритма
+        if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+            return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+        }
+        return v.publicKey, nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    if claims, ok := token.Claims.(*entity.JWTClaims); ok && token.Valid {
+        return claims, nil
+    }
+
+    return nil, errors.New("invalid token")
+}
+```
+
+---
+
+## 2. Access Token
+
+### Параметры
+
+| Параметр | Значение | Конфигурация |
+|----------|----------|--------------|
+| **Алгоритм** | RS256 | `VONDIAUTH_JWT_ALGORITHM` |
+| **Время жизни** | 15 минут | `VONDIAUTH_JWT_ACCESS_TOKEN_DURATION=15m` |
+| **Issuer** | https://auth.vondi.rs | `VONDIAUTH_JWT_ISSUER` |
+| **Audience** | https://vondi.rs | `VONDIAUTH_JWT_AUDIENCE` |
+| **Private Key** | /opt/vondi/keys/private.pem | `VONDIAUTH_JWT_PRIVATE_KEY_PATH` |
+| **Public Key** | /opt/vondi/keys/public.pem | `VONDIAUTH_JWT_PUBLIC_KEY_PATH` |
+
+### Генерация Access Token
+
+**Процесс:**
+1. Загрузка user из БД (включая roles)
+2. Формирование JWTClaims с user данными
+3. Создание JWT token с методом RS256
+4. Подпись токена приватным ключом
+5. Кодирование в Base64URL формат
+
+**Код (internal/service/token/jwt.go):**
+```go
+func (s *JWTService) GenerateAccessToken(ctx context.Context, user *domain.User) (string, error) {
+    now := time.Now()
+    expiresAt := now.Add(s.config.AccessTokenDuration) // 15m
+
+    // Получение ролей пользователя
+    roles := []string{"user"}
+    if s.roleService != nil {
+        userRoles, err := s.roleService.GetUserRoleNames(ctx, user.ID)
+        if err == nil && len(userRoles) > 0 {
+            roles = userRoles
+        }
+    }
+
+    claims := domain.JWTClaims{
+        RegisteredClaims: jwt.RegisteredClaims{
+            ID:        uuid.New().String(),
+            Subject:   fmt.Sprintf("%d", user.ID),
+            Issuer:    s.config.Issuer,
+            Audience:  jwt.ClaimStrings{s.config.Audience},
+            ExpiresAt: jwt.NewNumericDate(expiresAt),
+            IssuedAt:  jwt.NewNumericDate(now),
+            NotBefore: jwt.NewNumericDate(now),
+        },
+        UserID:           user.ID,
+        UserUUID:         user.UUID.String(),
+        Email:            user.Email,
+        Name:             user.Name,
+        Provider:         string(user.Provider),
+        Roles:            roles,
+        TermAccepted:     user.TermAccepted,
+        EmailVerified:    user.EmailVerified,
+        TwoFactorEnabled: user.TwoFactorEnabled,
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+    return token.SignedString(s.privateKey)
+}
+```
+
+### Хранение Access Token
+
+**Frontend (Next.js BFF):**
+- Токен хранится в httpOnly cookie `access_token`
+- Не доступен JavaScript (защита от XSS)
+- SameSite=Lax (защита от CSRF)
+- Secure=true (только HTTPS в production)
+
+**Backend/Microservices:**
+- Токен передаётся в HTTP заголовке `Authorization: Bearer <token>`
+- Валидируется локально через public key
+- Не требует обращения к Auth Service для каждого запроса
+
+### Время жизни: 15 минут
+
+**Почему 15 минут:**
+- Краткосрочность снижает риск при компрометации
+- Refresh token mechanism обеспечивает бесшовный UX
+- Баланс между безопасностью и производительностью
+- Соответствует OWASP рекомендациям для access tokens
+
+**Обновление:**
+- Автоматически через refresh token endpoint
+- Клиент следит за истечением через `exp` claim
+- Проактивное обновление за 1-2 минуты до истечения
+
+---
+
+## 3. Refresh Token
+
+### Параметры
+
+| Параметр | Значение | Конфигурация |
+|----------|----------|--------------|
+| **Алгоритм** | SHA-256 Hash | - |
+| **Время жизни** | 30 дней (720h) | `VONDIAUTH_JWT_REFRESH_TOKEN_DURATION=720h` |
+| **Storage** | PostgreSQL (auth.refresh_tokens) | - |
+| **Rotation** | Да (автоматически при refresh) | - |
+| **Family ID** | UUID v4 (token chain tracking) | - |
+
+### Структура Refresh Token
+
+**JWT Payload:**
+```json
+{
+  "jti": "uuid-v4",                    // Token ID
+  "sub": "123",                         // User ID
+  "iss": "https://auth.vondi.rs",
+  "aud": ["https://vondi.rs"],
+  "exp": 1706039334,                   // Через 30 дней
+  "iat": 1703361234,
+  "nbf": 1703361234,
+  "family_id": "uuid-v4",              // Vondi: ID цепочки токенов
+  "device_id": "device-fingerprint"    // Vondi: ID устройства
+}
+```
+
+**Database Record (auth.refresh_tokens):**
+```sql
+CREATE TABLE refresh_tokens (
+    id              BIGSERIAL PRIMARY KEY,
+    jti             uuid UNIQUE NOT NULL,              -- JWT ID
+    user_id         bigint NOT NULL,                   -- Владелец токена
+    token_hash      text UNIQUE NOT NULL,              -- SHA-256 hash токена
+    family_id       uuid NOT NULL,                     -- ID цепочки токенов
+    parent_token_id bigint,                            -- Предыдущий токен в цепочке
+
+    device_id       text,                              -- Идентификатор устройства
+    device_name     text,                              -- Название устройства
+    ip_address      text,                              -- IP при создании
+    user_agent      text,                              -- User-Agent при создании
+
+    expires_at      timestamp with time zone NOT NULL, -- Срок действия
+    is_revoked      boolean DEFAULT false,             -- Отозван?
+    revoked_at      timestamp with time zone,          -- Когда отозван
+    revoked_reason  text,                              -- Причина отзыва
+    used_at         timestamp with time zone,          -- Когда использован
+    use_count       bigint DEFAULT 0,                  -- Сколько раз использован
+    created_at      timestamp with time zone           -- Создан
+);
+```
+
+### Token Rotation Mechanism
+
+**Принцип работы:**
+1. Клиент отправляет refresh token
+2. Auth Service валидирует токен и проверяет use_count
+3. Если `use_count > 0` → ошибка (reuse attack detection)
+4. Генерация нового refresh token с тем же `family_id`
+5. Старый токен помечается как использованный (`use_count = 1`, `used_at = now()`)
+6. Новый токен сохраняется в БД с `parent_token_id = old_token.id`
+7. Оба токена (access + refresh) возвращаются клиенту
+
+**Код (internal/service/token/refresh.go):**
+```go
+func (s *RefreshTokenService) RotateRefreshToken(
+    oldToken *domain.RefreshToken, user *domain.User,
+) (*domain.RefreshToken, string, error) {
+    // Проверка на повторное использование
+    if oldToken.UseCount > 1 {
+        return nil, "", domain.ErrRefreshTokenReused
+    }
+
+    // Генерация нового токена с тем же family_id
+    tokenString, err := s.jwtService.GenerateRefreshToken(
+        user,
+        oldToken.FamilyID,
+        s.extractDeviceID(oldToken),
+    )
+    if err != nil {
+        return nil, "", err
+    }
+
+    // Извлечение JTI из нового токена
+    claims, err := s.jwtService.ValidateRefreshToken(tokenString)
+    if err != nil {
+        return nil, "", err
+    }
+
+    jti, _ := uuid.Parse(claims.ID)
+
+    // Создание записи в БД
+    newToken := &domain.RefreshToken{
+        JTI:           jti,
+        UserID:        user.ID,
+        TokenHash:     s.hashToken(tokenString), // SHA-256
+        FamilyID:      oldToken.FamilyID,
+        ParentTokenID: &oldToken.ID,
+        DeviceID:      oldToken.DeviceID,
+        ExpiresAt:     claims.ExpiresAt.Time,
+        CreatedAt:     time.Now(),
+    }
+
+    // Помечаем старый токен использованным
+    oldToken.RecordUse()
+
+    return newToken, tokenString, nil
+}
+```
+
+### Reuse Attack Detection
+
+**Механизм защиты:**
+- Database trigger `detect_refresh_token_reuse` на таблице `refresh_tokens`
+- Срабатывает при `UPDATE use_count > 1`
+- Действия при обнаружении:
+  1. Отзыв **всех токенов в family** (is_revoked = true)
+  2. Запись в audit_log с action='token_reuse_detected'
+  3. Возврат ошибки клиенту
+  4. Требование повторной аутентификации
+
+**SQL Trigger:**
+```sql
+CREATE FUNCTION detect_token_reuse() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.use_count > 1 THEN
+        -- Отозвать всю цепочку токенов
+        UPDATE refresh_tokens
+        SET is_revoked = TRUE,
+            revoked_at = CURRENT_TIMESTAMP,
+            revoked_reason = 'reuse_detected'
+        WHERE family_id = NEW.family_id;
+
+        -- Аудит
+        INSERT INTO audit_log (user_id, action, resource, resource_id, metadata, created_at)
+        VALUES (
+            NEW.user_id,
+            'token_reuse_detected',
+            'refresh_token',
+            NEW.jti::text,
+            jsonb_build_object(
+                'family_id', NEW.family_id,
+                'ip_address', NEW.ip_address,
+                'user_agent', NEW.user_agent
+            ),
+            CURRENT_TIMESTAMP
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+```
+
+### Storage Best Practices
+
+**Хранение в БД:**
+- SHA-256 hash вместо plaintext токена
+- Невозможно восстановить токен из БД (one-way hash)
+- При краже БД атакующий не получит валидные токены
+
+**Индексы для производительности:**
+```sql
+CREATE UNIQUE INDEX idx_refresh_tokens_jti ON refresh_tokens (jti);
+CREATE UNIQUE INDEX idx_refresh_tokens_token_hash ON refresh_tokens (token_hash);
+CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens (user_id) WHERE NOT is_revoked;
+CREATE INDEX idx_refresh_tokens_family_id ON refresh_tokens (family_id);
+CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens (expires_at) WHERE NOT is_revoked;
+```
+
+---
+
+## 4. Google OAuth 2.0 Flow
+
+### Конфигурация
+
+```bash
+VONDIAUTH_OAUTH_GOOGLE_CLIENT_ID=1234567890-abcdefgh.apps.googleusercontent.com
+VONDIAUTH_OAUTH_GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxx
+```
+
+**Redirect URLs (настроены в Google Cloud Console):**
+- Local: `http://localhost:3001/api/v2/auth/google/callback`
+- Dev: `https://dev.vondi.rs/api/v2/auth/google/callback`
+- Prod: `https://vondi.rs/api/v2/auth/google/callback`
+
+### OAuth Flow Sequence
+
+```
+1. User → Frontend: Click "Login with Google"
+   ↓
+2. Frontend → Backend: GET /api/v2/auth/google
+   ↓
+3. Backend → Auth Service: GET /auth/google/url?redirect_url=...
+   ↓
+4. Auth Service → Backend: { "url": "https://accounts.google.com/o/oauth2/v2/auth?..." }
+   ↓
+5. Backend → Frontend: { "url": "..." }
+   ↓
+6. Frontend: Redirect to Google OAuth consent screen
+   ↓
+7. User: Approve permissions
+   ↓
+8. Google → Frontend: Redirect to /api/v2/auth/google/callback?code=...&state=...
+   ↓
+9. Frontend → Backend: POST /api/v2/auth/google/callback { code, state }
+   ↓
+10. Backend → Auth Service: POST /auth/google/callback { code, redirect_url }
+    ↓
+11. Auth Service → Google: Exchange code for access_token (OAuth 2.0 Token Exchange)
+    ↓
+12. Google → Auth Service: { access_token, id_token, ... }
+    ↓
+13. Auth Service → Google: GET /userinfo?access_token=... (получить email, name, picture)
+    ↓
+14. Auth Service: Find or Create user in database
+    ↓
+15. Auth Service: Generate access_token + refresh_token
+    ↓
+16. Auth Service → Backend: { access_token, refresh_token, user }
+    ↓
+17. Backend → Frontend: Set-Cookie: access_token, refresh_token (httpOnly)
+    ↓
+18. Frontend: Redirect to /dashboard
+```
+
+### User Provisioning
+
+**При первом входе через Google:**
+```go
+// internal/service/oauth/google.go
+func (s *GoogleOAuthService) ProcessCallback(ctx context.Context, code, redirectURL string) (*domain.User, error) {
+    // 1. Обмен code на access_token
+    token, err := s.oauth2Config.Exchange(ctx, code)
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. Получение информации о пользователе
+    userInfo, err := s.fetchUserInfo(ctx, token.AccessToken)
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. Поиск пользователя по email
+    user, err := s.userRepo.GetByEmail(ctx, userInfo.Email)
+
+    if err != nil {
+        // 4. Создание нового пользователя
+        user = &domain.User{
+            UUID:          uuid.New(),
+            Email:         userInfo.Email,
+            EmailNormalized: strings.ToLower(userInfo.Email),
+            Name:          userInfo.Name,
+            Provider:      domain.ProviderGoogle,
+            GoogleID:      &userInfo.ID,
+            PictureURL:    &userInfo.Picture,
+            EmailVerified: userInfo.EmailVerified,
+            IsActive:      true,
+        }
+
+        err = s.userRepo.Create(ctx, user)
+        if err != nil {
+            return nil, err
+        }
+    } else {
+        // 5. Обновление существующего пользователя
+        user.GoogleID = &userInfo.ID
+        if user.PictureURL == nil || *user.PictureURL == "" {
+            user.PictureURL = &userInfo.Picture
+        }
+        user.EmailVerified = user.EmailVerified || userInfo.EmailVerified
+
+        err = s.userRepo.Update(ctx, user)
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    return user, nil
+}
+```
+
+### Security Considerations
+
+**State Parameter:**
+- Генерируется случайным образом (crypto/rand)
+- Передаётся в Google и возвращается обратно
+- Защита от CSRF атак
+- Валидация при callback
+
+**PKCE (Proof Key for Code Exchange):**
+- Рекомендуется для публичных клиентов
+- В текущей реализации не используется (confidential client)
+- Можно добавить для мобильных приложений
+
+---
+
+## 5. Firebase Phone Authentication Flow
+
+### Конфигурация
+
+```bash
+VONDIAUTH_FIREBASE_PROJECT_ID=vondi-prod
+VONDIAUTH_FIREBASE_SERVICE_ACCOUNT_KEY_PATH=/opt/vondi/keys/firebase-adminsdk.json
+```
+
+**Альтернативно:**
+```bash
+GOOGLE_APPLICATION_CREDENTIALS=/opt/vondi/keys/firebase-adminsdk.json
+```
+
+### Phone Auth Sequence
+
+```
+1. User → Frontend: Enter phone number (+381641234567)
+   ↓
+2. Frontend → Firebase SDK: Send verification code
+   ↓
+3. Firebase → User Phone: SMS with 6-digit code
+   ↓
+4. User → Frontend: Enter code from SMS
+   ↓
+5. Frontend → Firebase SDK: Verify code
+   ↓
+6. Firebase SDK → Frontend: ID Token (signed JWT)
+   ↓
+7. Frontend → Backend: POST /api/v2/auth/firebase { id_token }
+   ↓
+8. Backend → Auth Service: POST /auth/firebase { id_token }
+   ↓
+9. Auth Service → Firebase Admin SDK: Verify ID Token
+   ↓
+10. Firebase Admin SDK: Decode and validate token
+    ↓
+11. Auth Service: Extract phone number from token claims
+    ↓
+12. Auth Service: Find or Create user in database
+    ↓
+13. Auth Service: Generate access_token + refresh_token
+    ↓
+14. Auth Service → Backend: { access_token, refresh_token, user }
+    ↓
+15. Backend → Frontend: Set-Cookie: access_token, refresh_token
+    ↓
+16. Frontend: Redirect to /dashboard
+```
+
+### Firebase ID Token Verification
+
+**Код (internal/service/oauth/firebase.go):**
+```go
+func (s *FirebaseAuthService) VerifyIDToken(ctx context.Context, idToken string) (*domain.User, error) {
+    // 1. Верификация токена через Firebase Admin SDK
+    token, err := s.firebaseApp.Auth().VerifyIDToken(ctx, idToken)
+    if err != nil {
+        return nil, fmt.Errorf("invalid firebase token: %w", err)
+    }
+
+    // 2. Извлечение phone number из claims
+    phoneNumber, ok := token.Claims["phone_number"].(string)
+    if !ok || phoneNumber == "" {
+        return nil, errors.New("phone number not found in token")
+    }
+
+    // 3. Поиск пользователя по phone
+    user, err := s.userRepo.GetByPhone(ctx, phoneNumber)
+
+    if err != nil {
+        // 4. Создание нового пользователя
+        user = &domain.User{
+            UUID:          uuid.New(),
+            Email:         "", // Email опционален для phone auth
+            Phone:         &phoneNumber,
+            PhoneVerified: true,
+            Provider:      "firebase",
+            IsActive:      true,
+        }
+
+        err = s.userRepo.Create(ctx, user)
+        if err != nil {
+            return nil, err
+        }
+    } else {
+        // 5. Обновление phone_verified
+        user.PhoneVerified = true
+        err = s.userRepo.Update(ctx, user)
+    }
+
+    return user, nil
+}
+```
+
+### Firebase Token Claims
+
+**Пример ID Token payload:**
+```json
+{
+  "iss": "https://securetoken.google.com/vondi-prod",
+  "aud": "vondi-prod",
+  "auth_time": 1703361234,
+  "user_id": "firebase-uid-xxxx",
+  "sub": "firebase-uid-xxxx",
+  "iat": 1703361234,
+  "exp": 1703364834,
+  "phone_number": "+381641234567",
+  "firebase": {
+    "identities": {
+      "phone": ["+381641234567"]
+    },
+    "sign_in_provider": "phone"
+  }
+}
+```
+
+### Phone Number Format
+
+**E.164 International Format:**
+- Обязательный префикс `+`
+- Код страны + номер
+- Примеры:
+  - Serbia: `+381641234567`
+  - US: `+14155551234`
+  - Russia: `+79161234567`
+
+---
+
+## 6. Session Management
+
+### Active Sessions Tracking
+
+**Database Schema:**
+```sql
+CREATE TABLE user_sessions (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         bigint NOT NULL,
+    family_id       uuid NOT NULL,                 -- Связь с refresh_token
+    device_id       text,
+    device_name     text,
+    ip_address      text,
+    user_agent      text,
+    last_activity   timestamp with time zone,
+    created_at      timestamp with time zone,
+    expires_at      timestamp with time zone,
+
+    FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
+
+CREATE INDEX idx_sessions_user ON user_sessions (user_id);
+CREATE INDEX idx_sessions_family ON user_sessions (family_id);
+CREATE INDEX idx_sessions_expires ON user_sessions (expires_at);
+```
+
+### Multi-Device Management
+
+**Пользователь может:**
+1. Просмотреть все активные сессии (GET /auth/sessions)
+2. Завершить конкретную сессию (DELETE /auth/sessions/:family_id)
+3. Завершить все сессии кроме текущей (POST /auth/sessions/revoke-all-except-current)
+
+**Пример ответа GET /auth/sessions:**
+```json
+{
+  "sessions": [
+    {
+      "family_id": "uuid-1",
+      "device_name": "Chrome on Windows",
+      "ip_address": "192.168.1.100",
+      "last_activity": "2025-12-21T12:00:00Z",
+      "created_at": "2025-12-20T10:00:00Z",
+      "is_current": true
+    },
+    {
+      "family_id": "uuid-2",
+      "device_name": "Safari on iPhone",
+      "ip_address": "192.168.1.101",
+      "last_activity": "2025-12-21T08:00:00Z",
+      "created_at": "2025-12-15T14:00:00Z",
+      "is_current": false
+    }
+  ]
+}
+```
+
+### Session Revocation
+
+**Immediate Token Invalidation:**
+```go
+func (s *SessionService) RevokeSession(ctx context.Context, userID int, familyID uuid.UUID) error {
+    // 1. Отозвать все refresh tokens в family
+    err := s.refreshTokenRepo.RevokeByFamilyID(ctx, familyID, "user_initiated")
+    if err != nil {
+        return err
+    }
+
+    // 2. Удалить сессию из БД
+    err = s.sessionRepo.Delete(ctx, familyID)
+    if err != nil {
+        return err
+    }
+
+    // 3. Добавить access token в blacklist (если нужна немедленная инвалидация)
+    // Опционально: можно дождаться истечения access token (15 минут)
+
+    return nil
+}
+```
+
+---
+
+## 7. Account Lockout (Brute-force Protection)
+
+### Параметры
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| **Max Attempts** | 5 | Максимум неудачных попыток входа |
+| **Lockout Duration** | 15 минут | Длительность блокировки |
+| **Counter Reset** | При успешном входе | Сброс failed_login_attempts |
+
+### Механизм работы
+
+**User Entity (internal/domain/user.go):**
+```go
+type User struct {
+    FailedLoginAttempts int        `json:"-"`
+    LockedUntil         *time.Time `json:"-"`
+    // ...
+}
+
+func (u *User) IsLocked() bool {
+    if u.LockedUntil == nil {
+        return false
+    }
+    return u.LockedUntil.After(time.Now())
+}
+
+func (u *User) IncrementFailedAttempts() {
+    u.FailedLoginAttempts++
+    if u.FailedLoginAttempts >= 5 {
+        u.LockAccount(15 * time.Minute)
+    }
+}
+
+func (u *User) LockAccount(duration time.Duration) {
+    lockTime := time.Now().Add(duration)
+    u.LockedUntil = &lockTime
+}
+
+func (u *User) UnlockAccount() {
+    u.FailedLoginAttempts = 0
+    u.LockedUntil = nil
+}
+
+func (u *User) RecordLogin(ip, userAgent string) {
+    now := time.Now()
+    u.LastLoginAt = &now
+    u.LastLoginIP = &ip
+    u.LastLoginUserAgent = &userAgent
+    u.FailedLoginAttempts = 0  // Сброс счётчика
+    u.LockedUntil = nil
+}
+```
+
+### Login Flow с Lockout
+
+```go
+func (s *AuthService) Login(ctx context.Context, req *entity.UserLoginRequest) (*entity.LoginResponse, error) {
+    // 1. Получить пользователя
+    user, err := s.userRepo.GetByEmail(ctx, req.Email)
+    if err != nil {
+        return nil, domain.ErrInvalidCredentials
+    }
+
+    // 2. Проверка блокировки
+    if user.IsLocked() {
+        return nil, domain.ErrAccountLocked
+    }
+
+    // 3. Проверка пароля
+    err = bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(req.Password))
+    if err != nil {
+        // Неверный пароль - инкремент счётчика
+        user.IncrementFailedAttempts()
+        s.userRepo.Update(ctx, user)
+
+        if user.IsLocked() {
+            return nil, domain.ErrAccountLocked
+        }
+        return nil, domain.ErrInvalidCredentials
+    }
+
+    // 4. Успешный вход - сброс счётчика
+    user.RecordLogin(req.IPAddress, req.UserAgent)
+    s.userRepo.Update(ctx, user)
+
+    // 5. Генерация токенов
+    // ...
+}
+```
+
+### Автоматическая разблокировка
+
+**Проверка при каждом входе:**
+- Если `LockedUntil < time.Now()` → аккаунт разблокирован
+- Счётчик `FailedLoginAttempts` не сбрасывается автоматически
+- Сброс только при успешном входе
+
+**Опционально: Scheduled Job для очистки:**
+```sql
+-- Сброс старых блокировок (можно запускать каждый час)
+UPDATE auth.users
+SET failed_login_attempts = 0,
+    locked_until = NULL
+WHERE locked_until IS NOT NULL
+  AND locked_until < CURRENT_TIMESTAMP;
+```
+
+---
+
+## 8. Password Hashing (Bcrypt)
+
+### Параметры
+
+```bash
+VONDIAUTH_SECURITY_BCRYPT_COST=12
+```
+
+**Bcrypt Cost:**
+- Минимум: 10
+- Рекомендуемый: 12 (по умолчанию)
+- Максимум: 31
+
+**Время хеширования (на современном CPU):**
+- Cost 10: ~65ms
+- Cost 12: ~250ms  ← используется
+- Cost 14: ~1000ms
+
+### Почему Bcrypt?
+
+1. **Adaptive hashing** - cost можно увеличивать по мере роста вычислительной мощности
+2. **Slow by design** - защита от brute-force атак
+3. **Automatic salt generation** - уникальная соль для каждого пароля
+4. **Widely audited** - проверенный временем алгоритм
+
+### Password Hashing
+
+**Код (internal/service/auth/auth.go):**
+```go
+func (s *AuthService) Register(ctx context.Context, req *entity.UserRegisterRequest) (*entity.LoginResponse, error) {
+    // 1. Валидация пароля
+    if len(req.Password) < 8 {
+        return nil, errors.New("password must be at least 8 characters")
+    }
+
+    // 2. Хеширование пароля
+    passwordHash, err := bcrypt.GenerateFromPassword(
+        []byte(req.Password),
+        s.config.Security.BcryptCost, // 12
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. Создание пользователя
+    user := &domain.User{
+        UUID:            uuid.New(),
+        Email:           req.Email,
+        EmailNormalized: strings.ToLower(req.Email),
+        Name:            req.Name,
+        PasswordHash:    stringPtr(string(passwordHash)),
+        Provider:        domain.ProviderLocal,
+        IsActive:        true,
+    }
+
+    err = s.userRepo.Create(ctx, user)
+    // ...
+}
+```
+
+### Password Verification
+
+```go
+func (s *AuthService) Login(ctx context.Context, req *entity.UserLoginRequest) (*entity.LoginResponse, error) {
+    user, err := s.userRepo.GetByEmail(ctx, req.Email)
+    if err != nil {
+        return nil, domain.ErrInvalidCredentials
+    }
+
+    // Constant-time comparison (bcrypt.CompareHashAndPassword)
+    err = bcrypt.CompareHashAndPassword(
+        []byte(*user.PasswordHash),
+        []byte(req.Password),
+    )
+    if err != nil {
+        // Timing-safe error - не раскрывает что именно неверно (email или пароль)
+        return nil, domain.ErrInvalidCredentials
+    }
+
+    // ...
+}
+```
+
+### Password Policy
+
+**Требования (рекомендуемые):**
+- Минимум 8 символов
+- Хотя бы одна заглавная буква (опционально)
+- Хотя бы одна цифра (опционально)
+- Хотя бы один спецсимвол (опционально)
+
+**ВАЖНО:** Не усложнять без необходимости
+- NIST рекомендует длину > сложность
+- Фокус на защите от brute-force через bcrypt cost
+- Обязательный 2FA для критичных операций
+
+### Password Change
+
+**Требования:**
+1. Текущий пароль (для подтверждения)
+2. Новый пароль (минимум 8 символов)
+3. Confirmation (повтор нового пароля)
+
+**После смены пароля:**
+- Отзыв всех refresh tokens (logout everywhere)
+- Принудительный re-login
+- Email уведомление о смене пароля
+
+---
+
+## 9. Key Management
+
+### RSA Keys Location
+
+**Development:**
+```
+/p/github.com/vondi-global/auth/keys/
+├── private.pem  (RSA 2048-bit, PKCS1)
+└── public.pem   (PKIX format)
+```
+
+**Production (vondi.rs, dev.vondi.rs):**
+```
+/opt/vondi/keys/
+├── private.pem
+└── public.pem
+```
+
+**Permissions:**
+```bash
+chmod 600 private.pem
+chmod 644 public.pem
+chown vondi:vondi *.pem
+```
+
+### Key Distribution
+
+**Auth Service:**
+- Требует оба ключа (private + public)
+- Private key для подписи токенов
+- Public key для валидации refresh tokens
+
+**Other Services (Monolith, Microservices):**
+- Требуют только public key
+- Валидация access tokens без обращения к Auth Service
+- Синхронизация через SSH/Git/Config Management
+
+### Key Rotation Strategy
+
+**Рекомендации:**
+1. Ротация ключей каждые 6-12 месяцев
+2. Поддержка старого ключа в течение grace period (24-48 часов)
+3. Плавный переход без downtime
+
+**Процесс ротации:**
+```bash
+# 1. Генерация новых ключей
+openssl genrsa -out private_new.pem 2048
+openssl rsa -in private_new.pem -pubout -out public_new.pem
+
+# 2. Обновление конфигурации Auth Service (multi-key support)
+VONDIAUTH_JWT_PRIVATE_KEY_PATH=/opt/vondi/keys/private_new.pem
+VONDIAUTH_JWT_PUBLIC_KEY_PATH_OLD=/opt/vondi/keys/public.pem      # старый
+VONDIAUTH_JWT_PUBLIC_KEY_PATH=/opt/vondi/keys/public_new.pem      # новый
+
+# 3. Перезапуск Auth Service (подписывает новым ключом, валидирует оба)
+
+# 4. Обновление public key на всех сервисах (монолит, микросервисы)
+
+# 5. Через 48 часов: удаление старого ключа
+rm /opt/vondi/keys/private.pem /opt/vondi/keys/public.pem
+```
+
+### Backup & Recovery
+
+**Backup:**
+```bash
+# Encrypted backup
+tar czf keys-$(date +%Y%m%d).tar.gz -C /opt/vondi keys/
+gpg -c keys-$(date +%Y%m%d).tar.gz  # Шифрование паролем
+mv keys-*.tar.gz.gpg /mnt/backup/
+```
+
+**Recovery:**
+```bash
+gpg -d keys-20251221.tar.gz.gpg > keys-20251221.tar.gz
+tar xzf keys-20251221.tar.gz -C /opt/vondi
+chown -R vondi:vondi /opt/vondi/keys
+chmod 600 /opt/vondi/keys/private.pem
+```
+
+---
+
+## 10. Service-to-Service Authentication (S2S)
+
+### Механизм
+
+**Принцип:**
+1. Сервис регистрируется в Auth Service как service account
+2. Сервис получает service JWT token с claim `service_name`
+3. Сервис передаёт оба токена:
+   - `Authorization: Bearer <service_token>` - идентификация сервиса
+   - `X-User-Token: <user_access_token>` - контекст пользователя
+
+### Service Account Creation
+
+**SQL:**
+```sql
+INSERT INTO auth.users (
+    uuid, email, email_normalized, name, provider, is_active, email_verified
+) VALUES (
+    gen_random_uuid(),
+    'service@tasktracker.vondi.rs',
+    'service@tasktracker.vondi.rs',
+    'TaskTracker Service',
+    'service',
+    true,
+    true
+);
+
+-- Присвоение роли service
+INSERT INTO auth.user_roles (user_id, role_id)
+SELECT u.id, r.id
+FROM auth.users u
+CROSS JOIN auth.roles r
+WHERE u.email = 'service@tasktracker.vondi.rs'
+  AND r.name = 'service';
+```
+
+### Service Token Generation
+
+**Через Auth Service API:**
+```bash
+curl -X POST http://localhost:28086/auth/service-token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service_email": "service@tasktracker.vondi.rs",
+    "service_name": "tasktracker"
+  }'
+```
+
+**Response:**
+```json
+{
+  "service_token": "eyJhbGciOiJSUzI1NiIs...",
+  "expires_in": 900
+}
+```
+
+**Service Token Claims:**
+```json
+{
+  "user_id": 999,
+  "email": "service@tasktracker.vondi.rs",
+  "service_name": "tasktracker",
+  "roles": ["service"],
+  "exp": 1703361234
+}
+```
+
+### Dual Token Validation
+
+**Receiving Service (e.g., Payment Service):**
+```go
+func (s *PaymentService) CreatePayment(ctx context.Context, req *pb.CreatePaymentRequest) (*pb.Payment, error) {
+    // 1. Извлечь оба токена из метаданных
+    md, ok := metadata.FromIncomingContext(ctx)
+    if !ok {
+        return nil, status.Error(codes.Unauthenticated, "missing metadata")
+    }
+
+    serviceToken := md.Get("authorization")[0] // "Bearer <token>"
+    userToken := md.Get("x-user-token")[0]
+
+    // 2. Валидация service token
+    serviceClaims, err := s.authClient.ValidateToken(ctx, serviceToken)
+    if err != nil || serviceClaims.ServiceName == "" {
+        return nil, status.Error(codes.Unauthenticated, "invalid service token")
+    }
+
+    // 3. Валидация user token
+    userClaims, err := s.authClient.ValidateToken(ctx, userToken)
+    if err != nil {
+        return nil, status.Error(codes.Unauthenticated, "invalid user token")
+    }
+
+    // 4. Создание платежа с аудитом
+    payment := &Payment{
+        UserID:           userClaims.UserID,
+        Amount:           req.Amount,
+        CreatedByService: serviceClaims.ServiceName, // "tasktracker"
+    }
+
+    s.db.Create(payment)
+
+    log.Printf("Service '%s' creating payment for user %d", serviceClaims.ServiceName, userClaims.UserID)
+
+    return payment, nil
+}
+```
+
+### Automatic Token Refresh (ServiceTokenManager)
+
+**Библиотека pkg/service:**
+```go
+tokenManager, err := service.NewServiceTokenManager(&service.ServiceTokenConfig{
+    ServiceEmail: "service@tasktracker.vondi.rs",
+    ServiceName:  "tasktracker",
+    AuthURL:      "http://auth-service:28086",
+})
+
+// Автоматическое обновление в фоне каждые 12 минут
+tokenManager.Start(ctx)
+
+// Получение актуального токена
+token := tokenManager.GetToken()
+```
+
+---
+
+## 11. Security Best Practices
+
+### Token Security
+
+1. **Access Token:**
+   - Короткое время жизни (15 минут)
+   - Только httpOnly cookies на frontend
+   - Authorization header на backend
+   - Не хранить в localStorage/sessionStorage
+
+2. **Refresh Token:**
+   - Только httpOnly cookies
+   - Rotation при каждом использовании
+   - SHA-256 hash в БД
+   - Reuse detection с отзывом family
+
+3. **Private Key:**
+   - Permissions 600
+   - Вне git репозитория (.gitignore)
+   - Encrypted backup
+   - Ротация каждые 6-12 месяцев
+
+### Rate Limiting
+
+**Конфигурация:**
+```bash
+VONDIAUTH_SECURITY_RATE_LIMIT_ENABLED=true
+VONDIAUTH_SECURITY_RATE_LIMIT_LOGIN=5/15m        # 5 попыток за 15 минут
+VONDIAUTH_SECURITY_RATE_LIMIT_REGISTER=3/1h      # 3 регистрации за час
+VONDIAUTH_SECURITY_RATE_LIMIT_TOKEN_REFRESH=30/1m # 30 refresh за минуту
+```
+
+### Audit Logging
+
+**Важные события для логирования:**
+- Login (успех/неудача)
+- Registration
+- Password change
+- Token refresh
+- Token reuse detection
+- Session revocation
+- Role changes
+- 2FA enable/disable
+
+**Audit Log Schema:**
+```sql
+CREATE TABLE audit_log (
+    id            BIGSERIAL PRIMARY KEY,
+    user_id       bigint,
+    action        text NOT NULL,              -- 'login', 'token_reuse_detected', etc.
+    resource      text,                       -- 'refresh_token', 'user', etc.
+    resource_id   text,
+    ip_address    text,
+    user_agent    text,
+    request_id    bytea,
+    old_values    jsonb,
+    new_values    jsonb,
+    metadata      jsonb,
+    success       boolean DEFAULT true,
+    error_message text,
+    created_at    timestamp with time zone
+);
+```
+
+### CSRF Protection
+
+```bash
+VONDIAUTH_SECURITY_ENABLE_CSRF=true
+VONDIAUTH_SECURITY_CSRF_TOKEN_DURATION=24h
+```
+
+**Механизм:**
+- CSRF token в cookie (SameSite=Strict)
+- Проверка при state-changing операциях (POST, PUT, DELETE)
+- Исключение для API endpoints с Bearer auth
+
+---
+
+## 12. Monitoring & Alerting
+
+### Prometheus Metrics
+
+**Auth Service экспортирует:**
+- `auth_login_attempts_total{status="success|failure"}`
+- `auth_token_refresh_total{status="success|failure"}`
+- `auth_token_reuse_detected_total`
+- `auth_account_lockout_total`
+- `auth_oauth_callback_total{provider="google|firebase"}`
+
+### Alerts
+
+**Критичные алерты:**
+1. **Mass Token Reuse Detection** - > 5 событий за 5 минут
+2. **High Failed Login Rate** - > 100 неудач за минуту (возможная DDoS)
+3. **Private Key Read Error** - Auth Service не может прочитать ключ
+4. **Database Connection Failure** - потеря связи с PostgreSQL
+
+### Health Checks
+
+**Endpoints:**
+- `GET /health` - базовая проверка (200 OK)
+- `GET /health/ready` - готовность принимать трафик (БД доступна)
+- `GET /health/live` - живость процесса
+
+---
+
+## 13. Диаграммы
+
+### Authentication Flow Diagram
+
+```
+┌─────────────┐       ┌──────────────┐       ┌──────────────┐       ┌───────────────┐
+│   Browser   │       │   Frontend   │       │   Backend    │       │ Auth Service  │
+│   (User)    │       │  (Next.js)   │       │   (Fiber)    │       │  (Internal)   │
+└──────┬──────┘       └──────┬───────┘       └──────┬───────┘       └───────┬───────┘
+       │                     │                      │                       │
+       │  1. POST /login     │                      │                       │
+       ├────────────────────>│                      │                       │
+       │                     │                      │                       │
+       │                     │  2. POST /api/v1/auth/login                  │
+       │                     ├─────────────────────>│                       │
+       │                     │                      │                       │
+       │                     │                      │  3. POST /auth/login  │
+       │                     │                      ├──────────────────────>│
+       │                     │                      │                       │
+       │                     │                      │                       │  4. Validate
+       │                     │                      │                       │     credentials
+       │                     │                      │                       │  5. Generate
+       │                     │                      │                       │     JWT tokens
+       │                     │                      │                       │
+       │                     │                      │  6. {access_token,    │
+       │                     │                      │      refresh_token}   │
+       │                     │                      │<──────────────────────┤
+       │                     │                      │                       │
+       │                     │  7. Set-Cookie:      │                       │
+       │                     │     access_token     │                       │
+       │                     │     refresh_token    │                       │
+       │                     │<─────────────────────┤                       │
+       │                     │                      │                       │
+       │  8. Redirect /dash  │                      │                       │
+       │<────────────────────┤                      │                       │
+       │                     │                      │                       │
+```
+
+### Token Refresh Flow
+
+```
+┌─────────────┐       ┌──────────────┐       ┌──────────────┐       ┌───────────────┐
+│   Browser   │       │   Frontend   │       │   Backend    │       │ Auth Service  │
+└──────┬──────┘       └──────┬───────┘       └──────┬───────┘       └───────┬───────┘
+       │                     │                      │                       │
+       │  Access token       │                      │                       │
+       │  expires in 1 min   │                      │                       │
+       │                     │                      │                       │
+       │                     │  1. POST /api/v1/auth/refresh                │
+       │                     ├─────────────────────>│                       │
+       │                     │  Cookie: refresh_token                       │
+       │                     │                      │                       │
+       │                     │                      │  2. POST /auth/refresh│
+       │                     │                      ├──────────────────────>│
+       │                     │                      │  {refresh_token}      │
+       │                     │                      │                       │
+       │                     │                      │                       │  3. Validate
+       │                     │                      │                       │  4. Check reuse
+       │                     │                      │                       │  5. Rotate token
+       │                     │                      │                       │  6. Generate new
+       │                     │                      │                       │     access_token
+       │                     │                      │                       │
+       │                     │                      │  7. {access_token,    │
+       │                     │                      │      refresh_token}   │
+       │                     │                      │<──────────────────────┤
+       │                     │                      │                       │
+       │                     │  8. Set-Cookie (new) │                       │
+       │                     │<─────────────────────┤                       │
+       │                     │                      │                       │
+```
+
+---
+
+## Заключение
+
+Система аутентификации Vondi обеспечивает:
+
+- **Безопасность:** RS256 JWT, bcrypt, token rotation, reuse detection
+- **Масштабируемость:** Stateless JWT, локальная валидация, multi-provider OAuth
+- **Удобство:** httpOnly cookies, автоматический refresh, multi-device sessions
+- **Аудит:** Полное логирование событий безопасности
+- **Гибкость:** Поддержка user auth, OAuth, phone auth, service-to-service
+
+**Ключевые метрики безопасности:**
+- Access token: 15 минут
+- Refresh token: 30 дней с rotation
+- Bcrypt cost: 12 (~250ms)
+- Account lockout: 5 попыток / 15 минут
+- Token reuse: немедленный отзыв всей family
+
+**Следующие шаги улучшения:**
+1. Добавить WebAuthn/FIDO2 для passwordless auth
+2. Реализовать adaptive MFA на основе risk score
+3. Внедрить device fingerprinting
+4. PKCE для OAuth (мобильные приложения)
+5. Key rotation automation
